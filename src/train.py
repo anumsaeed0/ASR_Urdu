@@ -30,7 +30,7 @@ TRANSCRIPT_KEYS = ["text", "sentence", "normalized_text", "transcript", "transcr
 
 def initialize_accelerator(args):
     accelerator = Accelerator(
-        mixed_precision='fp16' if torch.cuda.is_available() else 'no',
+        mixed_precision='no',
         log_with="tensorboard",
         project_dir=args.output_dir
     )
@@ -278,7 +278,6 @@ def setup_optimizer_scheduler(model, learning_rate):
 
     return optimizer, scheduler
 
-
 def train_epoch(model, dataloader, optimizer, accelerator):
     model.train()
     total_loss = 0.0
@@ -287,19 +286,20 @@ def train_epoch(model, dataloader, optimizer, accelerator):
     progress_bar = tqdm(dataloader, desc="Training", disable=not accelerator.is_local_main_process, leave=False)
     
     for batch in progress_bar:
-        # The Accelerator handles the 'autocast' for fp16 automatically 
-        # because you initialized it with mixed_precision='fp16'
+        # MANUAL CASTING FIX:
+        # We must move the batch to the correct device AND the correct dtype (fp16/half)
+        # to match the model loaded via torch_dtype=torch.float16
+        batch = {k: v.to(device=accelerator.device, dtype=torch.float16 if v.dtype == torch.float32 else v.dtype) 
+                 for k, v in batch.items()}
+
         outputs = model(**batch, use_cache=False)
         loss = outputs.loss
 
         # Backpropagation
         accelerator.backward(loss)
 
-        # GRADIENT CLIPPING FIX:
-        # Instead of manual unscaling, use accelerator.clip_grad_norm_ 
-        # ONLY after ensuring gradients are ready.
         if accelerator.sync_gradients:
-            accelerator.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
 
         optimizer.step()
         optimizer.zero_grad()
@@ -332,6 +332,9 @@ def validate(model, dataloader, processor, wer_metric, accelerator):
     progress_bar = tqdm(dataloader, desc="Validating", disable=not accelerator.is_local_main_process, leave=False)
     
     for batch in progress_bar:
+        # Apply the same casting here
+        batch = {k: v.to(device=accelerator.device, dtype=torch.float16 if v.dtype == torch.float32 else v.dtype) 
+                 for k, v in batch.items()}
         with torch.no_grad():
             outputs = model(**batch, use_cache=False)
             loss = outputs.loss
