@@ -1,4 +1,6 @@
+# tensorboard --logdir ./whisper-fr-LoRA
 # Import necessary modules and libraries
+
 import os
 import sys
 import argparse
@@ -30,12 +32,11 @@ TRANSCRIPT_KEYS = ["text", "sentence", "normalized_text", "transcript", "transcr
 
 def initialize_accelerator(args):
     accelerator = Accelerator(
-        mixed_precision='no',
+        mixed_precision='fp16',
         log_with="tensorboard",
         project_dir=args.output_dir
     )
     return accelerator
-
 
 def set_environment(accelerator, seed):
     """
@@ -173,42 +174,31 @@ def load_and_prepare_datasets(args, processor):
     )
 
     return datasets
-
 def setup_model(processor):
-    """
-    Load the Whisper model and apply LoRA adapters to fine-tune it.
-
-    Args:
-        processor (WhisperProcessor): The processor used for handling the model inputs.
-
-    Returns:
-        PeftModel: The Whisper model with LoRA adapters applied.
-    """
-    logging.info("Loading Whisper-large-v3-turbo-urdu model and applying LoRA...")
-
+    logging.info("Loading model for GradScaler (FP16 base + FP32 LoRA)...")
+    
+    # Load base model in FP16
     whisper_model = WhisperForConditionalGeneration.from_pretrained(
-        "kingabzpro/whisper-large-v3-turbo-urdu",
-        torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32
+        "kingabzpro/whisper-large-v3-urdu",
+        torch_dtype=torch.float16, 
+        use_cache=False 
     )
 
-    # Set up LoRA configuration
     lora_config = LoraConfig(
-        inference_mode=False,
-        r=4,  # Dimensionality of LoRA
-        lora_alpha=16,  # Scaling factor for LoRA
-        lora_dropout=0.05,  # Dropout to prevent overfitting
-        target_modules=['q_proj', 'v_proj'],  # The parts of the model we’re modifying
-        bias="none"  # No bias term for simplicity
+        r=32,           
+        lora_alpha=64,  
+        target_modules=["q_proj", "v_proj"],
+        lora_dropout=0.05,
+        bias="none"
     )
 
-    # Add LoRA to the Whisper model
     model = get_peft_model(whisper_model, lora_config)
     
-    # Check and log the model size and parameter counts
-    count_parameters(model)
-    module_sizes = compute_module_sizes(model)
-    logging.info(f"\nModel size: {module_sizes[''] * 1e-9:.2f} GB\n")
-
+    # GradScaler REQUIREMENT: Trainable parameters must be Float32
+    for name, param in model.named_parameters():
+        if param.requires_grad:
+            param.data = param.data.to(torch.float32)
+            
     return model
 
 
@@ -281,34 +271,26 @@ def setup_optimizer_scheduler(model, learning_rate):
 def train_epoch(model, dataloader, optimizer, accelerator):
     model.train()
     total_loss = 0.0
-    num_batches = len(dataloader)
-
-    progress_bar = tqdm(dataloader, desc="Training", disable=not accelerator.is_local_main_process, leave=False)
     
-    for batch in progress_bar:
-        # MANUAL CASTING FIX:
-        # We must move the batch to the correct device AND the correct dtype (fp16/half)
-        # to match the model loaded via torch_dtype=torch.float16
-        batch = {k: v.to(device=accelerator.device, dtype=torch.float16 if v.dtype == torch.float32 else v.dtype) 
-                 for k, v in batch.items()}
-
-        outputs = model(**batch, use_cache=False)
+    for batch in tqdm(dataloader, desc="Training", disable=not accelerator.is_local_main_process):
+        # Accelerator handles moving and casting to fp16/fp32 automatically
+        outputs = model(**batch)
         loss = outputs.loss
 
-        # Backpropagation
+        # This triggers the GradScaler.scale(loss).backward() internally
         accelerator.backward(loss)
-
+        
         if accelerator.sync_gradients:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            # GradScaler unscales the gradients here before clipping
+            accelerator.clip_grad_norm_(model.parameters(), 1.0)
 
+        # GradScaler.step() and GradScaler.update() happen here
         optimizer.step()
         optimizer.zero_grad()
-
+        
         total_loss += loss.item()
-        progress_bar.set_postfix({'loss': loss.item()})
-    
-    avg_loss = total_loss / num_batches
-    return avg_loss
+        
+    return total_loss / len(dataloader)
 
 
 def validate(model, dataloader, processor, wer_metric, accelerator):
@@ -383,7 +365,7 @@ def train(args):
 
     # Load the Whisper processor
     logging.info("Loading Whisper processor...")
-    processor = WhisperProcessor.from_pretrained("kingabzpro/whisper-large-v3-turbo-urdu", language="urdu", task="transcribe")
+    processor = WhisperProcessor.from_pretrained("kingabzpro/whisper-large-v3-urdu", language="urdu", task="transcribe")
 
     # Load and preprocess datasets
     datasets = load_and_prepare_datasets(args, processor=processor)
