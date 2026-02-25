@@ -5,7 +5,7 @@ import argparse
 import logging
 import warnings
 from pathlib import Path
-
+import librosa
 import torch
 from torch.utils.data import DataLoader
 from transformers import WhisperProcessor, WhisperForConditionalGeneration
@@ -13,7 +13,7 @@ from datasets import load_dataset, Audio
 from peft import LoraConfig, get_peft_model
 import evaluate
 from tqdm.auto import tqdm
-
+import numpy as np
 from accelerate import Accelerator
 from accelerate.utils import set_seed
 
@@ -28,17 +28,11 @@ logging.basicConfig(format="%(message)s", level=logging.INFO)
 # Common transcript keys across datasets
 TRANSCRIPT_KEYS = ["text", "sentence", "normalized_text", "transcript", "transcription"]
 
-def initialize_accelerator():
-    """
-    Initialize the Accelerator with the desired settings.
-
-    Returns:
-        Accelerator: Configured Accelerator instance.
-    """
+def initialize_accelerator(args):
     accelerator = Accelerator(
-        mixed_precision='fp16',  # Enable mixed precision for faster training
-        device_placement=True,
-        log_with="all"  # Adjust based on your logging preference
+        mixed_precision='fp16' if torch.cuda.is_available() else 'no',
+        log_with="tensorboard",
+        project_dir=args.output_dir
     )
     return accelerator
 
@@ -76,13 +70,15 @@ def load_and_prepare_datasets(args, processor):
     datasets["train"] = load_dataset(
       "google/fleurs",
       args.language,
-      split="train"
+      split="train",
+      trust_remote_code=True
       )
 
     datasets["validation"] = load_dataset(
       "google/fleurs",
       args.language,
-      split="validation"
+      split="validation",
+      trust_remote_code=True
     )
 
     # Keep only the audio and transcript columns
@@ -97,13 +93,41 @@ def load_and_prepare_datasets(args, processor):
         datasets["train"] = datasets["train"].select(range(min(args.debug_subset_size, len(datasets["train"]))))
         datasets["validation"] = datasets["validation"].select(range(min(args.debug_subset_size, len(datasets["validation"]))))
     
-    # Adjust the audio to the required sampling rate
+    # Adjust the audio to the required sampling rate (16kHz for Whisper)
     sampling_rate = processor.feature_extractor.sampling_rate
     datasets["train"] = datasets["train"].cast_column("audio", Audio(sampling_rate=sampling_rate))
     datasets["validation"] = datasets["validation"].cast_column("audio", Audio(sampling_rate=sampling_rate))
+    
+    # --- Preprocessing for Training (with 30% Degradation) ---
+    def preprocess_train(batch, idx):
+        audio = batch["audio"]
+        array = audio["array"]
+        orig_sr = audio["sampling_rate"]
 
-    # Preprocessing function for datasets
-    def preprocess_function(batch):
+        # Apply degradation: Downsample to 8k and upsample back to 16k
+        if idx % 10 < 3:
+            degraded = librosa.resample(array, orig_sr=orig_sr, target_sr=8000)
+            array = librosa.resample(degraded, orig_sr=8000, target_sr=orig_sr)
+            
+        # We only check a few samples to avoid slowing down training
+        if idx < 30: 
+            rolloff = librosa.feature.spectral_rolloff(y=array, sr=orig_sr, roll_percent=0.85)[0]
+            avg_rolloff = np.mean(rolloff)
+            
+            status = "SUCCESS" if avg_rolloff < 4100 else "WARNING"
+            logging.info(f"[Sample {idx}] Degradation Check: {status} (Avg Rolloff: {avg_rolloff:.2f} Hz)")
+        # ------------------------------------------
+            
+        processed = processor(
+            audio=array, 
+            sampling_rate=orig_sr,
+            text=batch["transcription"],
+        )
+        processed["input_length"] = len(array) / orig_sr
+        return processed
+
+    # --- Preprocessing for Validation (Clean Data) ---
+    def preprocess_val(batch):
         audio = batch["audio"]
         processed = processor(
             audio=audio["array"],
@@ -113,14 +137,17 @@ def load_and_prepare_datasets(args, processor):
         processed["input_length"] = len(audio["array"]) / audio["sampling_rate"]
         return processed
 
-    logging.info("Preprocessing datasets...")
+    logging.info("Preprocessing training set with 30% degradation...")
     datasets["train"] = datasets["train"].map(
-        preprocess_function,
+        preprocess_train,
+        with_indices=True,
         num_proc=args.num_workers,
         remove_columns=["audio", "transcription"],
     )
+
+    logging.info("Preprocessing validation set (clean)...")
     datasets["validation"] = datasets["validation"].map(
-        preprocess_function,
+        preprocess_val,
         num_proc=args.num_workers,
         remove_columns=["audio", "transcription"],
     )
@@ -253,37 +280,27 @@ def setup_optimizer_scheduler(model, learning_rate):
 
 
 def train_epoch(model, dataloader, optimizer, accelerator):
-    """
-    Run one epoch of training.
-
-    Args:
-        model (PeftModel): The model to train.
-        dataloader (DataLoader): The training DataLoader.
-        optimizer (torch.optim.Optimizer): Optimizer.
-        accelerator (Accelerator): Accelerator to handle distributed training.
-
-    Returns:
-        float: The average loss for this training epoch.
-    """
     model.train()
     total_loss = 0.0
     num_batches = len(dataloader)
 
-    # Progress bar to track training
     progress_bar = tqdm(dataloader, desc="Training", disable=not accelerator.is_local_main_process, leave=False)
     
     for batch in progress_bar:
+        # The Accelerator handles the 'autocast' for fp16 automatically 
+        # because you initialized it with mixed_precision='fp16'
         outputs = model(**batch, use_cache=False)
         loss = outputs.loss
-        loss = loss / accelerator.num_processes  # Account for distributed training
 
         # Backpropagation
         accelerator.backward(loss)
 
-        # Clip gradients to avoid exploding gradients
-        accelerator.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        # GRADIENT CLIPPING FIX:
+        # Instead of manual unscaling, use accelerator.clip_grad_norm_ 
+        # ONLY after ensuring gradients are ready.
+        if accelerator.sync_gradients:
+            accelerator.clip_grad_norm_(model.parameters(), max_norm=1.0)
 
-        # Update model weights
         optimizer.step()
         optimizer.zero_grad()
 
@@ -355,91 +372,86 @@ def save_model(model, processor, output_dir, accelerator):
         logging.info(f"Model and processor saved to {output_dir}")
 
 def train(args):
-    """
-    Main function to handle the entire training process, including model setup, training, validation, 
-    and saving the model. 
-    """
+    # Initialize Accelerator
+    accelerator = initialize_accelerator(args)
 
-    # Initialize Accelerator for handling hardware optimizations
-    accelerator = initialize_accelerator()
-
-    # Set environment, including seed and backend settings
+    # Set environment
     set_environment(accelerator, args.seed)
 
-    # Load the Whisper processor for handling data
+    # Load the Whisper processor
     logging.info("Loading Whisper processor...")
     processor = WhisperProcessor.from_pretrained("kingabzpro/whisper-large-v3-turbo-urdu", language="urdu", task="transcribe")
 
     # Load and preprocess datasets
-    datasets = load_and_prepare_datasets(
-        args,
-        processor=processor,
-    )
+    datasets = load_and_prepare_datasets(args, processor=processor)
 
-    # Set up the data collator for padding and batching
+    # Set up data collator
     data_collator = DataCollatorSpeechSeq2SeqWithPadding(processor=processor)
 
-    # Load Whisper model with LoRA adapters applied
+    # Load model
     model = setup_model(processor)
 
-    # Prepare DataLoaders for training and validation
-    train_dataloader, validation_dataloader = prepare_dataloaders(
-        args,
-        datasets=datasets,
-        data_collator=data_collator
-    )
+    # Prepare DataLoaders
+    train_dataloader, validation_dataloader = prepare_dataloaders(args, datasets, data_collator)
+    
+    # Initialize TensorBoard trackers
+    if accelerator.is_main_process:
+        accelerator.init_trackers("urdu_fine_tuning")
 
-    # Set up optimizer and learning rate scheduler
+    # Set up optimizer and scheduler
     optimizer, scheduler = setup_optimizer_scheduler(model, args.learning_rate)
 
-    # Prepare all components for training with Accelerator (handles parallelization and optimization)
+    # Prepare for training
     model, optimizer, train_dataloader, validation_dataloader, scheduler = accelerator.prepare(
         model, optimizer, train_dataloader, validation_dataloader, scheduler
     )
 
-    # Make sure the output directory exists
-    if accelerator.is_main_process:
-        os.makedirs(args.output_dir, exist_ok=True)
-
-    # Set up the evaluation metric for Word Error Rate (WER)
+    # Metrics and early stopping variables
     wer_metric = evaluate.load("wer")
-
-    # Initialize variables for early stopping
-    best_wer = float('inf')  # Set the best WER to a large value initially
-    epochs_no_improve = 0  # Track how many epochs since the last improvement
+    best_wer = float('inf')
+    epochs_no_improve = 0
 
     logging.info("Starting the training process...")
 
-    # Loop through each epoch
     for epoch in tqdm(range(args.num_train_epochs), desc="Epochs", disable=not accelerator.is_local_main_process, leave=False):
         logging.info(f"\nEpoch {epoch + 1}/{args.num_train_epochs}")
 
-        # Train for one epoch
+        # Training
         avg_train_loss = train_epoch(model, train_dataloader, optimizer, accelerator)
         logging.info(f"Average training loss: {avg_train_loss:.4f}")
 
-        # Validate the model to check performance
+        # Validation
         avg_eval_loss, avg_wer = validate(model, validation_dataloader, processor, wer_metric, accelerator)
         logging.info(f"Validation loss: {avg_eval_loss:.4f}, WER: {avg_wer:.4f}")
+        
+        # Log to TensorBoard
+        accelerator.log({
+            "train/loss": avg_train_loss,
+            "val/loss": avg_eval_loss,
+            "val/wer": avg_wer,
+            "train/learning_rate": optimizer.param_groups[0]['lr']
+        }, step=epoch)
 
-        # Adjust the learning rate based on validation loss
+        # Scheduler step
         scheduler.step(avg_eval_loss)
 
-        # Check if this is the best model so far
+        # Save Best Model
         if avg_wer < best_wer - args.early_stopping_min_delta:
             best_wer = avg_wer
             epochs_no_improve = 0
-            # Save the model if it improved
-            save_model(model, processor, args.output_dir, accelerator)
-            logging.info(f"New best WER: {best_wer:.4f}. Model saved.")
+            # Save into a dedicated 'best_model' subfolder
+            best_model_path = os.path.join(args.output_dir, "best_model")
+            save_model(model, processor, best_model_path, accelerator)
+            logging.info(f"New best WER: {best_wer:.4f}. Best model saved.")
         else:
             epochs_no_improve += 1
             logging.info(f"No improvement in WER for {epochs_no_improve} epoch(s).")
-            # If no improvement after a few epochs, stop training early
             if epochs_no_improve >= args.early_stopping_patience:
-                logging.info("Early stopping triggered. No significant improvement.")
+                logging.info("Early stopping triggered.")
                 break
 
+    # End training to flush logs
+    accelerator.end_training()
     logging.info("Training process completed.")
     if accelerator.is_main_process:
         logging.info(f"Model and LoRA adapters have been saved to {args.output_dir}. You can now evaluate the performance.")
