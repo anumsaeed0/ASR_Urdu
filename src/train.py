@@ -177,12 +177,14 @@ def load_and_prepare_datasets(args, processor):
 def setup_model(processor):
     logging.info("Loading model for GradScaler (FP16 base + FP32 LoRA)...")
     
-    # Load base model in FP16
     whisper_model = WhisperForConditionalGeneration.from_pretrained(
         "kingabzpro/whisper-large-v3-urdu",
         torch_dtype=torch.float16, 
         use_cache=False 
     )
+
+    # Enable Gradient Checkpointing for faster/larger training
+    whisper_model.gradient_checkpointing_enable()
 
     lora_config = LoraConfig(
         r=32,           
@@ -194,7 +196,6 @@ def setup_model(processor):
 
     model = get_peft_model(whisper_model, lora_config)
     
-    # GradScaler REQUIREMENT: Trainable parameters must be Float32
     for name, param in model.named_parameters():
         if param.requires_grad:
             param.data = param.data.to(torch.float32)
@@ -294,19 +295,6 @@ def train_epoch(model, dataloader, optimizer, accelerator):
 
 
 def validate(model, dataloader, processor, wer_metric, accelerator):
-    """
-    Validate the model on the validation set and calculate WER.
-
-    Args:
-        model (PeftModel): The trained model.
-        dataloader (DataLoader): Validation DataLoader.
-        processor (WhisperProcessor): Processor to decode predictions.
-        wer_metric (evaluate.Metric): Metric to calculate Word Error Rate (WER).
-        accelerator (Accelerator): Accelerator for distributed validation.
-
-    Returns:
-        tuple: (average validation loss, average WER)
-    """
     model.eval()
     total_eval_loss = 0.0
     total_wer = 0.0
@@ -314,20 +302,26 @@ def validate(model, dataloader, processor, wer_metric, accelerator):
     progress_bar = tqdm(dataloader, desc="Validating", disable=not accelerator.is_local_main_process, leave=False)
     
     for batch in progress_bar:
-        # Apply the same casting here
+        # 1. Cast and move batch to device (matches your FP16 model base)
         batch = {k: v.to(device=accelerator.device, dtype=torch.float16 if v.dtype == torch.float32 else v.dtype) 
                  for k, v in batch.items()}
+        
         with torch.no_grad():
+            # 2. Calculate Loss (Greedy/Teacher Forcing)
             outputs = model(**batch, use_cache=False)
-            loss = outputs.loss
-            loss = loss / accelerator.num_processes  # Normalize loss for distributed training
+            loss = outputs.loss / accelerator.num_processes
             total_eval_loss += loss.item()
 
-            # Decode predictions and calculate WER
-            logits = outputs.logits
-            predictions = torch.argmax(logits, dim=-1)
-            decoded_preds = processor.batch_decode(predictions, skip_special_tokens=True)
-
+            # 3. GENERATE TEXT (The fix for high WER)
+            # Use generate() to get the actual transcription
+            generated_ids = accelerator.unwrap_model(model).generate(
+                input_features=batch["input_features"],
+                max_length=448 # Whisper default max length
+            )
+            
+            # 4. Decode and compute WER
+            decoded_preds = processor.batch_decode(generated_ids, skip_special_tokens=True)
+            
             labels = batch["labels"]
             labels = torch.where(labels != -100, labels, processor.tokenizer.pad_token_id)
             decoded_labels = processor.batch_decode(labels, skip_special_tokens=True)
