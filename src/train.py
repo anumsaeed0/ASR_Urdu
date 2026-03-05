@@ -71,15 +71,13 @@ def load_and_prepare_datasets(args, processor):
     datasets["train"] = load_dataset(
       "google/fleurs",
       args.language,
-      split="train",
-      trust_remote_code=True
+      split="train"
       )
 
     datasets["validation"] = load_dataset(
       "google/fleurs",
       args.language,
-      split="validation",
-      trust_remote_code=True
+      split="validation"
     )
 
     # Keep only the audio and transcript columns
@@ -99,36 +97,10 @@ def load_and_prepare_datasets(args, processor):
     datasets["train"] = datasets["train"].cast_column("audio", Audio(sampling_rate=sampling_rate))
     datasets["validation"] = datasets["validation"].cast_column("audio", Audio(sampling_rate=sampling_rate))
     
-    # --- Preprocessing for Training (with 30% Degradation) ---
-    def preprocess_train(batch, idx):
-        audio = batch["audio"]
-        array = audio["array"]
-        orig_sr = audio["sampling_rate"]
-
-        # Apply degradation: Downsample to 8k and upsample back to 16k
-        if idx % 10 < 3:
-            degraded = librosa.resample(array, orig_sr=orig_sr, target_sr=8000)
-            array = librosa.resample(degraded, orig_sr=8000, target_sr=orig_sr)
-            
-        # We only check a few samples to avoid slowing down training
-        if idx < 30: 
-            rolloff = librosa.feature.spectral_rolloff(y=array, sr=orig_sr, roll_percent=0.85)[0]
-            avg_rolloff = np.mean(rolloff)
-            
-            status = "SUCCESS" if avg_rolloff < 4100 else "WARNING"
-            logging.info(f"[Sample {idx}] Degradation Check: {status} (Avg Rolloff: {avg_rolloff:.2f} Hz)")
-        # ------------------------------------------
-            
-        processed = processor(
-            audio=array, 
-            sampling_rate=orig_sr,
-            text=batch["transcription"],
-        )
-        processed["input_length"] = len(array) / orig_sr
-        return processed
-
-    # --- Preprocessing for Validation (Clean Data) ---
-    def preprocess_val(batch):
+    # ******************************** 0% Downgrade ***********************************
+    
+    # Preprocessing function for datasets
+    def preprocess_function(batch):
         audio = batch["audio"]
         processed = processor(
             audio=audio["array"],
@@ -138,17 +110,14 @@ def load_and_prepare_datasets(args, processor):
         processed["input_length"] = len(audio["array"]) / audio["sampling_rate"]
         return processed
 
-    logging.info("Preprocessing training set with 30% degradation...")
+    logging.info("Preprocessing datasets...")
     datasets["train"] = datasets["train"].map(
-        preprocess_train,
-        with_indices=True,
+        preprocess_function,
         num_proc=args.num_workers,
         remove_columns=["audio", "transcription"],
     )
-
-    logging.info("Preprocessing validation set (clean)...")
     datasets["validation"] = datasets["validation"].map(
-        preprocess_val,
+        preprocess_function,
         num_proc=args.num_workers,
         remove_columns=["audio", "transcription"],
     )
@@ -174,11 +143,91 @@ def load_and_prepare_datasets(args, processor):
     )
 
     return datasets
+
+
+    # ******************************** 30% Downgrade ***********************************
+
+    # --- Preprocessing for Training (with 30% Degradation) ---
+    # def preprocess_train(batch, idx):
+    #     audio = batch["audio"]
+    #     array = audio["array"]
+    #     orig_sr = audio["sampling_rate"]
+
+    #     # Apply degradation: Downsample to 8k and upsample back to 16k
+    #     if idx % 10 < 3:
+    #         degraded = librosa.resample(array, orig_sr=orig_sr, target_sr=8000)
+    #         array = librosa.resample(degraded, orig_sr=8000, target_sr=orig_sr)
+            
+    #     # We only check a few samples to avoid slowing down training
+    #     if idx < 30: 
+    #         rolloff = librosa.feature.spectral_rolloff(y=array, sr=orig_sr, roll_percent=0.85)[0]
+    #         avg_rolloff = np.mean(rolloff)
+            
+    #         status = "SUCCESS" if avg_rolloff < 4100 else "WARNING"
+    #         logging.info(f"[Sample {idx}] Degradation Check: {status} (Avg Rolloff: {avg_rolloff:.2f} Hz)")
+    #     # ------------------------------------------
+            
+    #     processed = processor(
+    #         audio=array, 
+    #         sampling_rate=orig_sr,
+    #         text=batch["transcription"],
+    #     )
+    #     processed["input_length"] = len(array) / orig_sr
+    #     return processed
+
+    # # --- Preprocessing for Validation (Clean Data) ---
+    # def preprocess_val(batch):
+    #     audio = batch["audio"]
+    #     processed = processor(
+    #         audio=audio["array"],
+    #         sampling_rate=audio["sampling_rate"],
+    #         text=batch["transcription"],
+    #     )
+    #     processed["input_length"] = len(audio["array"]) / audio["sampling_rate"]
+    #     return processed
+
+    # logging.info("Preprocessing training set with 30% degradation...")
+    # datasets["train"] = datasets["train"].map(
+    #     preprocess_train,
+    #     with_indices=True,
+    #     num_proc=args.num_workers,
+    #     remove_columns=["audio", "transcription"],
+    # )
+
+    # logging.info("Preprocessing validation set (clean)...")
+    # datasets["validation"] = datasets["validation"].map(
+    #     preprocess_val,
+    #     num_proc=args.num_workers,
+    #     remove_columns=["audio", "transcription"],
+    # )
+
+    # # Filter out long audio samples
+    # def filter_length(batch):
+    #     return [length < args.max_input_length for length in batch["input_length"]]
+    
+    # logging.info("Filtering long audio samples...")
+    # datasets["train"] = datasets["train"].filter(
+    #     filter_length,
+    #     batched=True,
+    #     batch_size=1000,
+    #     num_proc=args.num_workers,
+    #     desc="Filtering training set"
+    # )
+    # datasets["validation"] = datasets["validation"].filter(
+    #     filter_length,
+    #     batched=True,
+    #     batch_size=1000,
+    #     num_proc=args.num_workers,
+    #     desc="Filtering validation set"
+    # )
+
+    # return datasets
+
 def setup_model(processor):
     logging.info("Loading model for GradScaler (FP16 base + FP32 LoRA)...")
     
     whisper_model = WhisperForConditionalGeneration.from_pretrained(
-        "kingabzpro/whisper-large-v3-urdu",
+        "openai/whisper-large-v3",
         torch_dtype=torch.float16, 
         use_cache=False 
     )
@@ -201,7 +250,6 @@ def setup_model(processor):
             param.data = param.data.to(torch.float32)
             
     return model
-
 
 def prepare_dataloaders(args, datasets, data_collator):
     """
@@ -236,7 +284,6 @@ def prepare_dataloaders(args, datasets, data_collator):
     )
 
     return train_dataloader, validation_dataloader
-
 
 def setup_optimizer_scheduler(model, learning_rate):
     """
@@ -293,7 +340,6 @@ def train_epoch(model, dataloader, optimizer, accelerator):
         
     return total_loss / len(dataloader)
 
-
 def validate(model, dataloader, processor, wer_metric, accelerator):
     model.eval()
     total_eval_loss = 0.0
@@ -333,7 +379,6 @@ def validate(model, dataloader, processor, wer_metric, accelerator):
     avg_wer = total_wer / len(dataloader)
     return avg_eval_loss, avg_wer
 
-
 def save_model(model, processor, output_dir, accelerator):
     """
     Save the trained model and processor.
@@ -359,7 +404,7 @@ def train(args):
 
     # Load the Whisper processor
     logging.info("Loading Whisper processor...")
-    processor = WhisperProcessor.from_pretrained("kingabzpro/whisper-large-v3-urdu", language="urdu", task="transcribe")
+    processor = WhisperProcessor.from_pretrained("openai/whisper-large-v3", language="urdu", task="transcribe")
 
     # Load and preprocess datasets
     datasets = load_and_prepare_datasets(args, processor=processor)
