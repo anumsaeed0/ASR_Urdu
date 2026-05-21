@@ -75,7 +75,8 @@ Key features:
 Run the training script to fine-tune the Whisper model:
 
 ```bash
-python main.py train --num_train_epochs 5 --train_batch_size 4 --learning_rate 1e-5 --output_dir ./whisper-ur-LoRA --num_workers 1 --max_input_length 30 --auth_token ```
+python main.py train --num_train_epochs 5 --train_batch_size 4 --learning_rate 1e-5 --output_dir ./whisper-ur-LoRA --num_workers 1 --max_input_length 30 --auth_token
+```
 
 **Arguments:**
 
